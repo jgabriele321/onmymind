@@ -47,13 +47,22 @@ func startHealthCheck() {
 }
 
 func initDB() error {
+	// Get data directory from environment or use default
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		// Local development fallback
+		dataDir = "data"
+	}
+
 	// Ensure data directory exists
-	if err := os.MkdirAll("data", 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return fmt.Errorf("failed to create data directory: %v", err)
 	}
 
 	// Open SQLite database
-	dbPath := filepath.Join("data", "mind.db")
+	dbPath := filepath.Join(dataDir, "mind.db")
+	log.Printf("Using database at: %s", dbPath)
+
 	var err error
 	db, err = sql.Open("sqlite3", dbPath)
 	if err != nil {
