@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,24 @@ var (
 	})
 	ldMutex = &sync.RWMutex{} // Protects lastDeleted map
 )
+
+func startHealthCheck() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	go func() {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+		})
+		log.Printf("Starting health check server on port %s", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Printf("Health check server error: %v", err)
+		}
+	}()
+}
 
 func initDB() error {
 	// Ensure data directory exists
@@ -90,6 +109,9 @@ func main() {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer db.Close()
+
+	// Start health check server
+	startHealthCheck()
 
 	// Load .env file
 	if err := loadEnv(".env"); err != nil {
