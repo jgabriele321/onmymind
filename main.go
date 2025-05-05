@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -16,9 +17,14 @@ import (
 )
 
 var (
-	db         *sql.DB
-	lastPulled = make(map[int64]string) // chatID → last pulled text
-	lpMutex    = &sync.RWMutex{}        // Protects lastPulled map
+	db          *sql.DB
+	lastPulled  = make(map[int64]string) // chatID → last pulled text
+	lpMutex     = &sync.RWMutex{}        // Protects lastPulled map
+	lastDeleted = make(map[int64]struct {
+		Text      string
+		DeletedAt time.Time
+	})
+	ldMutex = &sync.RWMutex{} // Protects lastDeleted map
 )
 
 func initDB() error {
@@ -168,6 +174,17 @@ func main() {
 							break
 						}
 
+						// Store the item for undo functionality
+						ldMutex.Lock()
+						lastDeleted[update.Message.Chat.ID] = struct {
+							Text      string
+							DeletedAt time.Time
+						}{
+							Text:      text,
+							DeletedAt: time.Now(),
+						}
+						ldMutex.Unlock()
+
 						// Move item to deleted table
 						if _, err := tx.Exec("INSERT INTO deleted (text) VALUES (?)", text); err != nil {
 							tx.Rollback()
@@ -242,13 +259,160 @@ func main() {
 							msg.Text = "🗑️ Deleted items:\n" + strings.Join(items, "\n")
 						}
 					}
+				case "export":
+					// Prepare response message
+					msg.Text = "📦 Preparing your data export..."
+					sentMsg, _ := bot.Send(msg)
+
+					// Fetch current items
+					rows, err := db.Query("SELECT text, created_at FROM items ORDER BY created_at")
+					if err != nil {
+						msg.Text = "❌ Failed to fetch items"
+						break
+					}
+					defer rows.Close()
+
+					var backup struct {
+						Items []struct {
+							Text      string    `json:"text"`
+							CreatedAt time.Time `json:"created_at"`
+						} `json:"items"`
+						DeletedItems []struct {
+							Text      string    `json:"text"`
+							DeletedAt time.Time `json:"deleted_at"`
+						} `json:"deleted_items"`
+						ExportedAt time.Time `json:"exported_at"`
+					}
+
+					backup.ExportedAt = time.Now()
+
+					// Read current items
+					for rows.Next() {
+						var item struct {
+							Text      string    `json:"text"`
+							CreatedAt time.Time `json:"created_at"`
+						}
+						if err := rows.Scan(&item.Text, &item.CreatedAt); err != nil {
+							continue
+						}
+						backup.Items = append(backup.Items, item)
+					}
+
+					// Fetch deleted items
+					rows, err = db.Query("SELECT text, deleted_at FROM deleted ORDER BY deleted_at")
+					if err != nil {
+						msg.Text = "❌ Failed to fetch deleted items"
+						break
+					}
+					defer rows.Close()
+
+					// Read deleted items
+					for rows.Next() {
+						var item struct {
+							Text      string    `json:"text"`
+							DeletedAt time.Time `json:"deleted_at"`
+						}
+						if err := rows.Scan(&item.Text, &item.DeletedAt); err != nil {
+							continue
+						}
+						backup.DeletedItems = append(backup.DeletedItems, item)
+					}
+
+					// Convert to pretty JSON
+					jsonData, err := json.MarshalIndent(backup, "", "    ")
+					if err != nil {
+						msg.Text = "❌ Failed to create backup"
+						break
+					}
+
+					// Create file with timestamp
+					filename := fmt.Sprintf("mindbot-backup-%s.json",
+						time.Now().Format("2006-01-02-150405"))
+
+					// Send as document
+					fileBytes := tgbot.FileBytes{
+						Name:  filename,
+						Bytes: jsonData,
+					}
+
+					doc := tgbot.NewDocument(update.Message.Chat.ID, fileBytes)
+					doc.Caption = fmt.Sprintf("📦 Your MindBot Backup\n• %d items\n• %d deleted items",
+						len(backup.Items), len(backup.DeletedItems))
+
+					if _, err := bot.Send(doc); err != nil {
+						msg.Text = "❌ Failed to send backup file"
+						break
+					}
+
+					// Delete the "preparing" message
+					deleteMsg := tgbot.NewDeleteMessage(update.Message.Chat.ID, sentMsg.MessageID)
+					bot.Send(deleteMsg)
+					continue
+
+				case "undo":
+					// Check if there's something to undo
+					ldMutex.RLock()
+					lastDel, exists := lastDeleted[update.Message.Chat.ID]
+					ldMutex.RUnlock()
+
+					if !exists {
+						msg.Text = "❌ Nothing to undo"
+						break
+					}
+
+					// Only allow undo within 1 hour of deletion
+					if time.Since(lastDel.DeletedAt) > time.Hour {
+						msg.Text = "❌ Can't undo deletions older than 1 hour"
+						break
+					}
+
+					// Start transaction
+					tx, err := db.Begin()
+					if err != nil {
+						log.Printf("Error starting transaction: %v", err)
+						msg.Text = "❌ Failed to undo deletion"
+						break
+					}
+
+					// Move item back to items table
+					if _, err := tx.Exec("INSERT INTO items (text) VALUES (?)", lastDel.Text); err != nil {
+						tx.Rollback()
+						log.Printf("Error restoring item: %v", err)
+						msg.Text = "❌ Failed to restore item"
+						break
+					}
+
+					// Remove from deleted table
+					if _, err := tx.Exec("DELETE FROM deleted WHERE text = ?", lastDel.Text); err != nil {
+						tx.Rollback()
+						log.Printf("Error removing from deleted: %v", err)
+						msg.Text = "❌ Failed to update deleted items"
+						break
+					}
+
+					if err := tx.Commit(); err != nil {
+						log.Printf("Error committing transaction: %v", err)
+						msg.Text = "❌ Failed to complete undo"
+						break
+					}
+
+					// Clear the last deleted item
+					ldMutex.Lock()
+					delete(lastDeleted, update.Message.Chat.ID)
+					ldMutex.Unlock()
+
+					msg.Text = fmt.Sprintf("✅ Restored: %s", lastDel.Text)
+
 				case "help":
 					msg.Text = `I understand these commands:
 /add <text> - Store new text
 /pull - Get a random item
 /delete - Delete the last pulled item
 /list - Show all stored items
-/deleted - Show deleted items`
+/deleted - Show deleted items
+/export - Download a backup of all your data
+/undo - Restore the last deleted item (within 1 hour)
+/help - Show this help message`
 				default:
 					msg.Text = "I don't know that command. Try /help"
 				}
