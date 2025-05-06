@@ -80,6 +80,13 @@ func initDB() error {
 		id INTEGER PRIMARY KEY,
 		text TEXT NOT NULL,
 		deleted_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS reminders (
+		id INTEGER PRIMARY KEY,
+		chat_id INTEGER NOT NULL,
+		message TEXT NOT NULL,
+		remind_at DATETIME NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -434,6 +441,45 @@ func main() {
 
 					msg.Text = fmt.Sprintf("✅ Restored: %s", lastDel.Text)
 
+				case "notifysetup":
+					msg.Text = `To ensure you never miss a reminder, set up notifications:
+
+1. Open our chat in Telegram
+2. Tap the three dots (⋮) at the top
+3. Select 'Notifications'
+4. Choose:
+   - Use Custom Notifications: ON
+   - Sound: Pick a distinctive sound
+   - Priority: High
+   - Override Do Not Disturb: ON
+
+Test your settings with: /testnotification`
+
+				case "testnotification":
+					// First notification
+					msg.Text = "🔔 Testing notifications (1/3)..."
+					msg.DisableNotification = false
+					if _, err := bot.Send(msg); err != nil {
+						log.Printf("Error sending test notification: %v", err)
+						continue
+					}
+
+					// Second notification after 1 second
+					time.Sleep(1 * time.Second)
+					msg.Text = "🚨 ALERT TEST (2/3)!"
+					if _, err := bot.Send(msg); err != nil {
+						log.Printf("Error sending test notification: %v", err)
+						continue
+					}
+
+					// Final notification after 1 second
+					time.Sleep(1 * time.Second)
+					msg.Text = "✅ If you heard all 3 notifications, you're all set! (3/3)"
+					if _, err := bot.Send(msg); err != nil {
+						log.Printf("Error sending test notification: %v", err)
+						continue
+					}
+
 				case "help":
 					msg.Text = `I understand these commands:
 /add <text> - Store new text
@@ -443,6 +489,8 @@ func main() {
 /deleted - Show deleted items
 /export - Download a backup of all your data
 /undo - Restore the last deleted item (within 1 hour)
+/notifysetup - Set up notifications for reminders
+/testnotification - Test notification settings
 /help - Show this help message`
 				default:
 					msg.Text = "I don't know that command. Try /help"
