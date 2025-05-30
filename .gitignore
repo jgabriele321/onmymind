@@ -1,0 +1,63 @@
+# Environment variables
+.env
+*.env
+.env.local
+.env.*.local
+
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+/bin/
+/dist/
+
+# Go workspace file
+go.work
+
+# Dependency directories
+node_modules/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Build artifacts
+build/
+dist/
+tmp/
+
+# Twilio specific
+.twilio-functions
+
+# Debug files
+debug/
+
+# Test coverage
+coverage/
+*.cover
+*.coverprofile
+
+# Binary files
+mindbot 
