@@ -14,6 +14,7 @@ import (
 	"time"
 
 	tgbot "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	timecalc "github.com/jgabriele321/onmymind/time"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -25,7 +26,8 @@ var (
 		Text      string
 		DeletedAt time.Time
 	})
-	ldMutex = &sync.RWMutex{} // Protects lastDeleted map
+	ldMutex        = &sync.RWMutex{} // Protects lastDeleted map
+	timeCalculator *timecalc.TimeCalculator
 )
 
 func startHealthCheck() {
@@ -132,6 +134,14 @@ func main() {
 		log.Fatal("BOT_TOKEN environment variable is not set")
 	}
 	log.Printf("Using token: %s...[last 5 chars hidden]", token[:len(token)-5])
+
+	openRouterKey := os.Getenv("OPENROUTER_KEY")
+	if openRouterKey == "" {
+		log.Fatal("OPENROUTER_KEY environment variable is not set")
+	}
+
+	// Initialize time calculator
+	timeCalculator = timecalc.NewTimeCalculator(openRouterKey)
 
 	// Simple version to test that the bot works
 	bot, err := tgbot.NewBotAPI(token)
@@ -442,8 +452,22 @@ func main() {
 /list - Show all stored items
 /deleted - Show deleted items
 /export - Download a backup of all your data
+/time <query> - Calculate times, convert between formats, or check time zones
 /undo - Restore the last deleted item (within 1 hour)
 /help - Show this help message`
+				case "time":
+					query := update.Message.CommandArguments()
+					if query == "" {
+						msg.Text = "Usage: /time <your time-related question>\n\nExamples:\n- /time what time is 14:00?\n- /time if my flight is at 9:45 AM and I need 1h drive + 30m security, when to leave?\n- /time what time is it in Tokyo?"
+					} else {
+						response, err := timeCalculator.ProcessQuery(query)
+						if err != nil {
+							log.Printf("Error processing time query: %v", err)
+							msg.Text = "Sorry, I encountered an error while processing your time query. Please try again."
+						} else {
+							msg.Text = response
+						}
+					}
 				default:
 					msg.Text = "I don't know that command. Try /help"
 				}
