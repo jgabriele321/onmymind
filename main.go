@@ -155,6 +155,7 @@ func main() {
 	if openRouterKey == "" {
 		log.Fatal("OPENROUTER_KEY environment variable is not set")
 	}
+	log.Printf("Using OpenRouter key: %s...[last 10 chars hidden]", openRouterKey[:len(openRouterKey)-10])
 
 	// Initialize time calculator
 	timeCalculator = timecalc.NewTimeCalculator(openRouterKey)
