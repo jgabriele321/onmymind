@@ -29,6 +29,8 @@ var (
 	})
 	ldMutex        = &sync.RWMutex{} // Protects lastDeleted map
 	timeCalculator *timecalc.TimeCalculator
+	importPending  = make(map[int64]bool) // chatID → is waiting for import file
+	importMutex    = &sync.RWMutex{}      // Protects importPending map
 )
 
 // BackupData represents the structure of our exported backup
@@ -180,6 +182,141 @@ func main() {
 			}
 
 			log.Printf("Received message: [%s] %s", update.Message.From.UserName, update.Message.Text)
+
+			// Check if this is a file for a pending import
+			if update.Message.Document != nil {
+				importMutex.RLock()
+				isPending := importPending[update.Message.Chat.ID]
+				importMutex.RUnlock()
+
+				if isPending {
+					msg := tgbot.NewMessage(update.Message.Chat.ID, "")
+					// Process the import file
+					file, err := bot.GetFile(tgbot.FileConfig{FileID: update.Message.Document.FileID})
+					if err != nil {
+						log.Printf("Error getting file: %v", err)
+						msg.Text = "Failed to access the backup file"
+						bot.Send(msg)
+						continue
+					}
+
+					// Download file
+					resp, err := http.Get(file.Link(bot.Token))
+					if err != nil {
+						log.Printf("Error downloading file: %v", err)
+						msg.Text = "Failed to download the backup file"
+						bot.Send(msg)
+						continue
+					}
+					defer resp.Body.Close()
+
+					// Read file content
+					content, err := io.ReadAll(resp.Body)
+					if err != nil {
+						log.Printf("Error reading file: %v", err)
+						msg.Text = "Failed to read the backup file"
+						bot.Send(msg)
+						continue
+					}
+
+					// Parse JSON
+					var backup BackupData
+					if err := json.Unmarshal(content, &backup); err != nil {
+						log.Printf("Error parsing JSON: %v", err)
+						msg.Text = "Invalid backup file format"
+						bot.Send(msg)
+						continue
+					}
+
+					// Start transaction
+					tx, err := db.Begin()
+					if err != nil {
+						log.Printf("Error starting transaction: %v", err)
+						msg.Text = "Failed to start import process"
+						bot.Send(msg)
+						continue
+					}
+
+					// Import items
+					var imported, skipped int
+					for _, item := range backup.Items {
+						// Check if item already exists
+						var exists bool
+						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM items WHERE text = ?)", item.Text).Scan(&exists)
+						if err != nil {
+							log.Printf("Error checking item existence: %v", err)
+							continue
+						}
+
+						if exists {
+							skipped++
+							continue
+						}
+
+						// Insert item with original timestamp
+						_, err = tx.Exec("INSERT INTO items (text, created_at) VALUES (?, ?)",
+							item.Text, item.CreatedAt)
+						if err != nil {
+							log.Printf("Error importing item: %v", err)
+							continue
+						}
+						imported++
+					}
+
+					// Import deleted items
+					var importedDeleted, skippedDeleted int
+					for _, item := range backup.DeletedItems {
+						// Check if item already exists in deleted items
+						var exists bool
+						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM deleted WHERE text = ?)", item.Text).Scan(&exists)
+						if err != nil {
+							log.Printf("Error checking deleted item existence: %v", err)
+							continue
+						}
+
+						if exists {
+							skippedDeleted++
+							continue
+						}
+
+						// Insert deleted item with original timestamp
+						_, err = tx.Exec("INSERT INTO deleted (text, deleted_at) VALUES (?, ?)",
+							item.Text, item.DeletedAt)
+						if err != nil {
+							log.Printf("Error importing deleted item: %v", err)
+							continue
+						}
+						importedDeleted++
+					}
+
+					// Commit transaction
+					if err := tx.Commit(); err != nil {
+						log.Printf("Error committing transaction: %v", err)
+						tx.Rollback()
+						msg.Text = "Failed to complete import"
+						bot.Send(msg)
+						continue
+					}
+
+					// Clear pending import state
+					importMutex.Lock()
+					delete(importPending, update.Message.Chat.ID)
+					importMutex.Unlock()
+
+					// Send success message with statistics
+					msg.Text = fmt.Sprintf("Import completed successfully!\n\n"+
+						"📥 Items imported: %d\n"+
+						"⏭️ Items skipped (duplicates): %d\n"+
+						"🗑️ Deleted items imported: %d\n"+
+						"⏭️ Deleted items skipped: %d\n\n"+
+						"Backup was from: %s",
+						imported, skipped,
+						importedDeleted, skippedDeleted,
+						backup.ExportedAt.Format("2006-01-02 15:04:05"))
+					bot.Send(msg)
+					continue
+				}
+			}
 
 			if update.Message.IsCommand() {
 				msg := tgbot.NewMessage(update.Message.Chat.ID, "")
@@ -459,123 +596,13 @@ func main() {
 					msg.Text = fmt.Sprintf("✅ Restored: %s", lastDel.Text)
 
 				case "import":
-					// Check if a file is attached
-					if update.Message.Document == nil {
-						msg.Text = "Please attach a backup file (JSON format) with the /import command"
-						break
-					}
+					// Set pending import state
+					importMutex.Lock()
+					importPending[update.Message.Chat.ID] = true
+					importMutex.Unlock()
 
-					// Get file info
-					file, err := bot.GetFile(tgbot.FileConfig{FileID: update.Message.Document.FileID})
-					if err != nil {
-						log.Printf("Error getting file: %v", err)
-						msg.Text = "Failed to access the backup file"
-						break
-					}
-
-					// Download file
-					resp, err := http.Get(file.Link(bot.Token))
-					if err != nil {
-						log.Printf("Error downloading file: %v", err)
-						msg.Text = "Failed to download the backup file"
-						break
-					}
-					defer resp.Body.Close()
-
-					// Read file content
-					content, err := io.ReadAll(resp.Body)
-					if err != nil {
-						log.Printf("Error reading file: %v", err)
-						msg.Text = "Failed to read the backup file"
-						break
-					}
-
-					// Parse JSON
-					var backup BackupData
-					if err := json.Unmarshal(content, &backup); err != nil {
-						log.Printf("Error parsing JSON: %v", err)
-						msg.Text = "Invalid backup file format"
-						break
-					}
-
-					// Start transaction
-					tx, err := db.Begin()
-					if err != nil {
-						log.Printf("Error starting transaction: %v", err)
-						msg.Text = "Failed to start import process"
-						break
-					}
-
-					// Import items
-					var imported, skipped int
-					for _, item := range backup.Items {
-						// Check if item already exists
-						var exists bool
-						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM items WHERE text = ?)", item.Text).Scan(&exists)
-						if err != nil {
-							log.Printf("Error checking item existence: %v", err)
-							continue
-						}
-
-						if exists {
-							skipped++
-							continue
-						}
-
-						// Insert item with original timestamp
-						_, err = tx.Exec("INSERT INTO items (text, created_at) VALUES (?, ?)",
-							item.Text, item.CreatedAt)
-						if err != nil {
-							log.Printf("Error importing item: %v", err)
-							continue
-						}
-						imported++
-					}
-
-					// Import deleted items
-					var importedDeleted, skippedDeleted int
-					for _, item := range backup.DeletedItems {
-						// Check if item already exists in deleted items
-						var exists bool
-						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM deleted WHERE text = ?)", item.Text).Scan(&exists)
-						if err != nil {
-							log.Printf("Error checking deleted item existence: %v", err)
-							continue
-						}
-
-						if exists {
-							skippedDeleted++
-							continue
-						}
-
-						// Insert deleted item with original timestamp
-						_, err = tx.Exec("INSERT INTO deleted (text, deleted_at) VALUES (?, ?)",
-							item.Text, item.DeletedAt)
-						if err != nil {
-							log.Printf("Error importing deleted item: %v", err)
-							continue
-						}
-						importedDeleted++
-					}
-
-					// Commit transaction
-					if err := tx.Commit(); err != nil {
-						log.Printf("Error committing transaction: %v", err)
-						tx.Rollback()
-						msg.Text = "Failed to complete import"
-						break
-					}
-
-					// Send success message with statistics
-					msg.Text = fmt.Sprintf("Import completed successfully!\n\n"+
-						"📥 Items imported: %d\n"+
-						"⏭️ Items skipped (duplicates): %d\n"+
-						"🗑️ Deleted items imported: %d\n"+
-						"⏭️ Deleted items skipped: %d\n\n"+
-						"Backup was from: %s",
-						imported, skipped,
-						importedDeleted, skippedDeleted,
-						backup.ExportedAt.Format("2006-01-02 15:04:05"))
+					msg.Text = "Please send your backup file (JSON format) in the next message.\n\n" +
+						"The file should be the one you received from the /export command."
 
 				case "help":
 					msg.Text = `I understand these commands:
