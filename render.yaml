@@ -3,8 +3,8 @@ services:
     name: onmuymind-bot
     env: go
     plan: starter # Adjust based on your needs
-    buildCommand: go build -o mindbot
-    startCommand: ./mindbot
+    buildCommand: go mod download && CGO_ENABLED=1 go build -o onmymind
+    startCommand: ./onmymind
     healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
