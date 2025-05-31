@@ -2,10 +2,13 @@ services:
   - type: web
     name: onmuymind-bot
     env: go
-    plan: starter # Adjust based on your needs
+    region: oregon # US West
+    plan: starter
+    rootDir: .
     buildCommand: ./render-build.sh
     startCommand: ./mindbot
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: BOT_TOKEN
         sync: false
