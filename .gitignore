@@ -60,4 +60,4 @@ coverage/
 *.coverprofile
 
 # Binary files
-mindbot 
+mindbot data/mind.db
