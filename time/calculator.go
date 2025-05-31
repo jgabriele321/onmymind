@@ -11,6 +11,60 @@ import (
 	"time"
 )
 
+// TimeZoneInfo holds information about a location's time zone
+type TimeZoneInfo struct {
+	Location    string
+	CurrentTime time.Time
+	ZoneName    string
+	Offset      int // offset in hours from UTC
+}
+
+// GetTimeZoneInfo returns the current time zone information for a location
+func GetTimeZoneInfo(location string) (*TimeZoneInfo, error) {
+	// Map common city names to IANA time zone names
+	timeZoneMap := map[string]string{
+		"london":    "Europe/London",
+		"austin":    "America/Chicago", // Austin uses Central Time
+		"new york":  "America/New_York",
+		"tokyo":     "Asia/Tokyo",
+		"paris":     "Europe/Paris",
+		"sydney":    "Australia/Sydney",
+		"singapore": "Asia/Singapore",
+		"dubai":     "Asia/Dubai",
+		"moscow":    "Europe/Moscow",
+		"berlin":    "Europe/Berlin",
+	}
+
+	// Clean up input
+	location = strings.ToLower(strings.TrimSpace(location))
+
+	// Try to find the time zone name
+	zoneName, ok := timeZoneMap[location]
+	if !ok {
+		// If not found in our map, try using the input directly
+		zoneName = location
+	}
+
+	// Load the location from the time zone database
+	loc, err := time.LoadLocation(zoneName)
+	if err != nil {
+		return nil, fmt.Errorf("unknown location %q: %v", location, err)
+	}
+
+	// Get current time in that location
+	now := time.Now().In(loc)
+
+	// Get zone name and offset
+	name, offset := now.Zone()
+
+	return &TimeZoneInfo{
+		Location:    location,
+		CurrentTime: now,
+		ZoneName:    name,
+		Offset:      offset / 3600, // Convert seconds to hours
+	}, nil
+}
+
 type OpenRouterRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
@@ -56,6 +110,25 @@ func (tc *TimeCalculator) ProcessQuery(query string) (string, error) {
 	// Get current time in UTC
 	now := time.Now()
 
+	// Try to get time zone info if this is a time zone query
+	var tzInfo *TimeZoneInfo
+	if strings.Contains(strings.ToLower(query), "time") && strings.Contains(strings.ToLower(query), "in") {
+		// Extract location from query (simple extraction, can be improved)
+		parts := strings.Split(strings.ToLower(query), "in")
+		if len(parts) > 1 {
+			location := strings.TrimSpace(parts[len(parts)-1])
+			// Remove common words
+			location = strings.TrimSuffix(location, "?")
+			location = strings.TrimPrefix(location, "the")
+			location = strings.TrimSpace(location)
+
+			info, err := GetTimeZoneInfo(location)
+			if err == nil {
+				tzInfo = info
+			}
+		}
+	}
+
 	systemPrompt := `You are a time calculation assistant. Your task is to:
 1. Parse time-related queries
 2. Show step-by-step calculations when relevant
@@ -63,22 +136,30 @@ func (tc *TimeCalculator) ProcessQuery(query string) (string, error) {
 4. Present results clearly and concisely
 5. Use the provided current time for all calculations
 6. Always show both 12h and 24h format in responses when relevant
-7. Consider daylight saving time (DST) when calculating time zones
 
-The current time will be provided with each query in UTC. You should use this to answer any questions about current time in any timezone.
+The current time will be provided with each query in UTC.`
 
-Important time zone notes:
-- Austin, TX uses Central Time (CT): UTC-6 in winter (CST), UTC-5 in summer (CDT)
-- London, UK uses British Time (BT): UTC+0 in winter (GMT), UTC+1 in summer (BST)
-- Always check if a location is currently observing DST before calculating
+	// Add time zone info to the prompt if available
+	if tzInfo != nil {
+		systemPrompt += fmt.Sprintf(`
+
+For your reference, I have queried the IANA Time Zone database and found:
+- Location: %s
+- Current local time: %s
+- Time zone: %s (UTC%+d)
+- DST is %s`,
+			tzInfo.Location,
+			tzInfo.CurrentTime.Format("15:04 MST"),
+			tzInfo.ZoneName,
+			tzInfo.Offset,
+			map[bool]string{true: "in effect", false: "not in effect"}[tzInfo.CurrentTime.IsDST()])
+	}
+
+	systemPrompt += `
 
 Example outputs:
 Q: "What time is 14:00?"
 A: 14:00 is 2:00 PM
-
-Q: "What time is it in Austin?"
-A: Given the current time [10:30 PM UTC]:
-Austin is currently in CDT (UTC-5), so it's 5:30 PM (17:30) in Austin, TX
 
 Q: "If my flight is at 9:45 AM and I need 1h drive + 30m security, when to leave?"
 A: Let's calculate backwards:
