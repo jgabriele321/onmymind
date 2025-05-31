@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -43,6 +45,11 @@ func NewTimeCalculator(openRouterKey string) *TimeCalculator {
 
 // ProcessQuery handles time-related queries using OpenRouter
 func (tc *TimeCalculator) ProcessQuery(query string) (string, error) {
+	if tc.openRouterKey == "" {
+		log.Printf("Error: OpenRouter API key is not set")
+		return "", fmt.Errorf("OpenRouter API key is not configured")
+	}
+
 	// We'll use Claude-2 for its strong reasoning capabilities
 	model := "anthropic/claude-2"
 
@@ -108,20 +115,30 @@ Keep responses focused and precise.`
 
 	resp, err := tc.client.Do(req)
 	if err != nil {
+		log.Printf("Error making request to OpenRouter: %v", err)
 		return "", fmt.Errorf("error making request: %v", err)
 	}
 	defer resp.Body.Close()
 
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading response body: %v", err)
+		return "", fmt.Errorf("error reading response: %v", err)
+	}
+
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("OpenRouter API error: Status %d, Body: %s", resp.StatusCode, string(body))
 		return "", fmt.Errorf("OpenRouter API error: %s", resp.Status)
 	}
 
 	var openRouterResp OpenRouterResponse
-	if err := json.NewDecoder(resp.Body).Decode(&openRouterResp); err != nil {
+	if err := json.Unmarshal(body, &openRouterResp); err != nil {
+		log.Printf("Error decoding response: %v, Body: %s", err, string(body))
 		return "", fmt.Errorf("error decoding response: %v", err)
 	}
 
 	if len(openRouterResp.Choices) == 0 {
+		log.Printf("No choices in response. Full response: %s", string(body))
 		return "", fmt.Errorf("no response from OpenRouter")
 	}
 
