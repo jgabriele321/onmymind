@@ -63,8 +63,14 @@ func (tc *TimeCalculator) ProcessQuery(query string) (string, error) {
 4. Present results clearly and concisely
 5. Use the provided current time for all calculations
 6. Always show both 12h and 24h format in responses when relevant
+7. Consider daylight saving time (DST) when calculating time zones
 
 The current time will be provided with each query in UTC. You should use this to answer any questions about current time in any timezone.
+
+Important time zone notes:
+- Austin, TX uses Central Time (CT): UTC-6 in winter (CST), UTC-5 in summer (CDT)
+- London, UK uses British Time (BT): UTC+0 in winter (GMT), UTC+1 in summer (BST)
+- Always check if a location is currently observing DST before calculating
 
 Example outputs:
 Q: "What time is 14:00?"
@@ -72,7 +78,7 @@ A: 14:00 is 2:00 PM
 
 Q: "What time is it in Austin?"
 A: Given the current time [10:30 PM UTC]:
-Austin is UTC-5, so it's 5:30 PM (17:30) in Austin, TX
+Austin is currently in CDT (UTC-5), so it's 5:30 PM (17:30) in Austin, TX
 
 Q: "If my flight is at 9:45 AM and I need 1h drive + 30m security, when to leave?"
 A: Let's calculate backwards:
