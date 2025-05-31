@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +30,19 @@ var (
 	ldMutex        = &sync.RWMutex{} // Protects lastDeleted map
 	timeCalculator *timecalc.TimeCalculator
 )
+
+// BackupData represents the structure of our exported backup
+type BackupData struct {
+	Items []struct {
+		Text      string    `json:"text"`
+		CreatedAt time.Time `json:"created_at"`
+	} `json:"items"`
+	DeletedItems []struct {
+		Text      string    `json:"text"`
+		DeletedAt time.Time `json:"deleted_at"`
+	} `json:"deleted_items"`
+	ExportedAt time.Time `json:"exported_at"`
+}
 
 func startHealthCheck() {
 	port := os.Getenv("PORT")
@@ -444,6 +458,125 @@ func main() {
 
 					msg.Text = fmt.Sprintf("✅ Restored: %s", lastDel.Text)
 
+				case "import":
+					// Check if a file is attached
+					if update.Message.Document == nil {
+						msg.Text = "Please attach a backup file (JSON format) with the /import command"
+						break
+					}
+
+					// Get file info
+					file, err := bot.GetFile(tgbot.FileConfig{FileID: update.Message.Document.FileID})
+					if err != nil {
+						log.Printf("Error getting file: %v", err)
+						msg.Text = "Failed to access the backup file"
+						break
+					}
+
+					// Download file
+					resp, err := http.Get(file.Link(bot.Token))
+					if err != nil {
+						log.Printf("Error downloading file: %v", err)
+						msg.Text = "Failed to download the backup file"
+						break
+					}
+					defer resp.Body.Close()
+
+					// Read file content
+					content, err := io.ReadAll(resp.Body)
+					if err != nil {
+						log.Printf("Error reading file: %v", err)
+						msg.Text = "Failed to read the backup file"
+						break
+					}
+
+					// Parse JSON
+					var backup BackupData
+					if err := json.Unmarshal(content, &backup); err != nil {
+						log.Printf("Error parsing JSON: %v", err)
+						msg.Text = "Invalid backup file format"
+						break
+					}
+
+					// Start transaction
+					tx, err := db.Begin()
+					if err != nil {
+						log.Printf("Error starting transaction: %v", err)
+						msg.Text = "Failed to start import process"
+						break
+					}
+
+					// Import items
+					var imported, skipped int
+					for _, item := range backup.Items {
+						// Check if item already exists
+						var exists bool
+						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM items WHERE text = ?)", item.Text).Scan(&exists)
+						if err != nil {
+							log.Printf("Error checking item existence: %v", err)
+							continue
+						}
+
+						if exists {
+							skipped++
+							continue
+						}
+
+						// Insert item with original timestamp
+						_, err = tx.Exec("INSERT INTO items (text, created_at) VALUES (?, ?)",
+							item.Text, item.CreatedAt)
+						if err != nil {
+							log.Printf("Error importing item: %v", err)
+							continue
+						}
+						imported++
+					}
+
+					// Import deleted items
+					var importedDeleted, skippedDeleted int
+					for _, item := range backup.DeletedItems {
+						// Check if item already exists in deleted items
+						var exists bool
+						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM deleted WHERE text = ?)", item.Text).Scan(&exists)
+						if err != nil {
+							log.Printf("Error checking deleted item existence: %v", err)
+							continue
+						}
+
+						if exists {
+							skippedDeleted++
+							continue
+						}
+
+						// Insert deleted item with original timestamp
+						_, err = tx.Exec("INSERT INTO deleted (text, deleted_at) VALUES (?, ?)",
+							item.Text, item.DeletedAt)
+						if err != nil {
+							log.Printf("Error importing deleted item: %v", err)
+							continue
+						}
+						importedDeleted++
+					}
+
+					// Commit transaction
+					if err := tx.Commit(); err != nil {
+						log.Printf("Error committing transaction: %v", err)
+						tx.Rollback()
+						msg.Text = "Failed to complete import"
+						break
+					}
+
+					// Send success message with statistics
+					msg.Text = fmt.Sprintf("Import completed successfully!\n\n"+
+						"📥 Items imported: %d\n"+
+						"⏭️ Items skipped (duplicates): %d\n"+
+						"🗑️ Deleted items imported: %d\n"+
+						"⏭️ Deleted items skipped: %d\n\n"+
+						"Backup was from: %s",
+						imported, skipped,
+						importedDeleted, skippedDeleted,
+						backup.ExportedAt.Format("2006-01-02 15:04:05"))
+
 				case "help":
 					msg.Text = `I understand these commands:
 /add <text> - Store new text
@@ -452,7 +585,8 @@ func main() {
 /list - Show all stored items
 /deleted - Show deleted items
 /export - Download a backup of all your data
-/time <query> - Calculate times, convert between formats, or check time zones
+/import - Import items from a backup file
+/time <query> - Calculate times, convert formats, or check time zones
 /undo - Restore the last deleted item (within 1 hour)
 /help - Show this help message`
 				case "time":
