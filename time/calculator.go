@@ -134,8 +134,11 @@ func (tc *TimeCalculator) ProcessQuery(query string) (string, error) {
 2. Show step-by-step calculations when relevant
 3. Handle time zones, formats (12h/24h), and arithmetic
 4. Present results clearly and concisely
-5. Use the provided current time for all calculations
+5. Use ONLY the provided time zone information for calculations
 6. Always show both 12h and 24h format in responses when relevant
+
+IMPORTANT: When time zone information is provided, DO NOT perform manual calculations. 
+Instead, use the exact local time that was queried from the IANA Time Zone database.
 
 The current time will be provided with each query in UTC.`
 
@@ -143,13 +146,16 @@ The current time will be provided with each query in UTC.`
 	if tzInfo != nil {
 		systemPrompt += fmt.Sprintf(`
 
-For your reference, I have queried the IANA Time Zone database and found:
-- Location: %s
-- Current local time: %s
-- Time zone: %s (UTC%+d)
-- DST is %s`,
+LOCATION TIME ZONE DATA (Use this exact information, do not calculate manually):
+• Location: %s
+• Current local time: %s
+• Time zone: %s (UTC%+d)
+• DST status: %s
+
+For time zone queries, use this information directly instead of doing manual calculations.
+`,
 			tzInfo.Location,
-			tzInfo.CurrentTime.Format("15:04 MST"),
+			tzInfo.CurrentTime.Format("3:04 PM (15:04)"),
 			tzInfo.ZoneName,
 			tzInfo.Offset,
 			map[bool]string{true: "in effect", false: "not in effect"}[tzInfo.CurrentTime.IsDST()])
@@ -168,11 +174,11 @@ A: Let's calculate backwards:
 3. Drive: -1 hour
 → You should leave at 8:15 AM (08:15)
 
-Keep responses focused and precise.`
+Keep responses focused and precise. For time zone queries, always use the provided IANA Time Zone data instead of doing manual calculations.`
 
 	// Add current time to user's query
 	queryWithTime := fmt.Sprintf("Current time: %s UTC\n\nQuery: %s",
-		now.Format("15:04 MST"),
+		now.Format("15:04"),
 		query)
 
 	messages := []Message{
