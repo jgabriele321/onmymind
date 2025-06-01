@@ -91,6 +91,12 @@ func initDB() error {
 }
 
 func loadEnv(filename string) error {
+	// Skip loading .env file in production (Render)
+	if os.Getenv("RENDER") != "" {
+		log.Printf("Running in Render, skipping .env file")
+		return nil
+	}
+
 	absPath, err := filepath.Abs(filename)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %v", err)
@@ -135,11 +141,12 @@ func main() {
 	// Start health check server
 	startHealthCheck()
 
-	// Load .env file
+	// Load .env file (only in development)
 	if err := loadEnv(".env"); err != nil {
 		log.Printf("Warning: Error loading .env file: %v", err)
 	}
 
+	// Get environment variables (works both in development and production)
 	token := os.Getenv("BOT_TOKEN")
 	if token == "" {
 		log.Fatal("BOT_TOKEN environment variable is not set")
