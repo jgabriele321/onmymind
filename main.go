@@ -3,9 +3,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -29,22 +27,7 @@ var (
 	})
 	ldMutex        = &sync.RWMutex{} // Protects lastDeleted map
 	timeCalculator *timecalc.TimeCalculator
-	importPending  = make(map[int64]bool) // chatID → is waiting for import file
-	importMutex    = &sync.RWMutex{}      // Protects importPending map
 )
-
-// BackupData represents the structure of our exported backup
-type BackupData struct {
-	Items []struct {
-		Text      string    `json:"text"`
-		CreatedAt time.Time `json:"created_at"`
-	} `json:"items"`
-	DeletedItems []struct {
-		Text      string    `json:"text"`
-		DeletedAt time.Time `json:"deleted_at"`
-	} `json:"deleted_items"`
-	ExportedAt time.Time `json:"exported_at"`
-}
 
 func startHealthCheck() {
 	port := os.Getenv("PORT")
@@ -108,12 +91,18 @@ func initDB() error {
 }
 
 func loadEnv(filename string) error {
-	file, err := os.Open(filename)
+	absPath, err := filepath.Abs(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get absolute path: %v", err)
+	}
+
+	file, err := os.Open(absPath)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %v", absPath, err)
 	}
 	defer file.Close()
 
+	log.Printf("Loading environment from: %s", absPath)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -124,6 +113,12 @@ func loadEnv(filename string) error {
 					value = strings.TrimSpace(line[equal+1:])
 				}
 				os.Setenv(key, value)
+				// Log key but mask the value for sensitive data
+				if strings.Contains(strings.ToLower(key), "key") || strings.Contains(strings.ToLower(key), "token") {
+					log.Printf("Set %s=***masked***", key)
+				} else {
+					log.Printf("Set %s=%s", key, value)
+				}
 			}
 		}
 	}
@@ -151,9 +146,9 @@ func main() {
 	}
 	log.Printf("Using token: %s...[last 5 chars hidden]", token[:len(token)-5])
 
-	openRouterKey := os.Getenv("OPENROUTER_KEY")
+	openRouterKey := os.Getenv("OPENROUTER_API_KEY")
 	if openRouterKey == "" {
-		log.Fatal("OPENROUTER_KEY environment variable is not set")
+		log.Fatal("OPENROUTER_API_KEY environment variable is not set")
 	}
 	log.Printf("Using OpenRouter key: %s...[last 10 chars hidden]", openRouterKey[:len(openRouterKey)-10])
 
@@ -184,465 +179,144 @@ func main() {
 
 			log.Printf("Received message: [%s] %s", update.Message.From.UserName, update.Message.Text)
 
-			// Check if this is a file for a pending import
-			if update.Message.Document != nil {
-				importMutex.RLock()
-				isPending := importPending[update.Message.Chat.ID]
-				importMutex.RUnlock()
-
-				if isPending {
-					msg := tgbot.NewMessage(update.Message.Chat.ID, "")
-					// Process the import file
-					file, err := bot.GetFile(tgbot.FileConfig{FileID: update.Message.Document.FileID})
-					if err != nil {
-						log.Printf("Error getting file: %v", err)
-						msg.Text = "Failed to access the backup file"
-						bot.Send(msg)
-						continue
-					}
-
-					// Download file
-					resp, err := http.Get(file.Link(bot.Token))
-					if err != nil {
-						log.Printf("Error downloading file: %v", err)
-						msg.Text = "Failed to download the backup file"
-						bot.Send(msg)
-						continue
-					}
-					defer resp.Body.Close()
-
-					// Read file content
-					content, err := io.ReadAll(resp.Body)
-					if err != nil {
-						log.Printf("Error reading file: %v", err)
-						msg.Text = "Failed to read the backup file"
-						bot.Send(msg)
-						continue
-					}
-
-					// Parse JSON
-					var backup BackupData
-					if err := json.Unmarshal(content, &backup); err != nil {
-						log.Printf("Error parsing JSON: %v", err)
-						msg.Text = "Invalid backup file format"
-						bot.Send(msg)
-						continue
-					}
-
-					// Start transaction
-					tx, err := db.Begin()
-					if err != nil {
-						log.Printf("Error starting transaction: %v", err)
-						msg.Text = "Failed to start import process"
-						bot.Send(msg)
-						continue
-					}
-
-					// Import items
-					var imported, skipped int
-					for _, item := range backup.Items {
-						// Check if item already exists
-						var exists bool
-						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM items WHERE text = ?)", item.Text).Scan(&exists)
-						if err != nil {
-							log.Printf("Error checking item existence: %v", err)
-							continue
-						}
-
-						if exists {
-							skipped++
-							continue
-						}
-
-						// Insert item with original timestamp
-						_, err = tx.Exec("INSERT INTO items (text, created_at) VALUES (?, ?)",
-							item.Text, item.CreatedAt)
-						if err != nil {
-							log.Printf("Error importing item: %v", err)
-							continue
-						}
-						imported++
-					}
-
-					// Import deleted items
-					var importedDeleted, skippedDeleted int
-					for _, item := range backup.DeletedItems {
-						// Check if item already exists in deleted items
-						var exists bool
-						err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM deleted WHERE text = ?)", item.Text).Scan(&exists)
-						if err != nil {
-							log.Printf("Error checking deleted item existence: %v", err)
-							continue
-						}
-
-						if exists {
-							skippedDeleted++
-							continue
-						}
-
-						// Insert deleted item with original timestamp
-						_, err = tx.Exec("INSERT INTO deleted (text, deleted_at) VALUES (?, ?)",
-							item.Text, item.DeletedAt)
-						if err != nil {
-							log.Printf("Error importing deleted item: %v", err)
-							continue
-						}
-						importedDeleted++
-					}
-
-					// Commit transaction
-					if err := tx.Commit(); err != nil {
-						log.Printf("Error committing transaction: %v", err)
-						tx.Rollback()
-						msg.Text = "Failed to complete import"
-						bot.Send(msg)
-						continue
-					}
-
-					// Clear pending import state
-					importMutex.Lock()
-					delete(importPending, update.Message.Chat.ID)
-					importMutex.Unlock()
-
-					// Send success message with statistics
-					msg.Text = fmt.Sprintf("Import completed successfully!\n\n"+
-						"📥 Items imported: %d\n"+
-						"⏭️ Items skipped (duplicates): %d\n"+
-						"🗑️ Deleted items imported: %d\n"+
-						"⏭️ Deleted items skipped: %d\n\n"+
-						"Backup was from: %s",
-						imported, skipped,
-						importedDeleted, skippedDeleted,
-						backup.ExportedAt.Format("2006-01-02 15:04:05"))
-					bot.Send(msg)
-					continue
-				}
+			if !update.Message.IsCommand() {
+				continue
 			}
 
-			if update.Message.IsCommand() {
-				msg := tgbot.NewMessage(update.Message.Chat.ID, "")
+			msg := tgbot.NewMessage(update.Message.Chat.ID, "")
 
-				switch update.Message.Command() {
-				case "add":
-					text := update.Message.CommandArguments()
-					if text == "" {
-						msg.Text = "Usage: /add something"
+			switch update.Message.Command() {
+			case "add":
+				text := update.Message.CommandArguments()
+				if text == "" {
+					msg.Text = "Usage: /add something"
+				} else {
+					// Store in database
+					if _, err := db.Exec("INSERT INTO items (text) VALUES (?)", text); err != nil {
+						log.Printf("Error storing item: %v", err)
+						msg.Text = "Failed to store item."
 					} else {
-						// Store in database
-						if _, err := db.Exec("INSERT INTO items (text) VALUES (?)", text); err != nil {
-							log.Printf("Error storing item: %v", err)
-							msg.Text = "Failed to store item."
-						} else {
-							msg.Text = fmt.Sprintf("Added: %s ✅", text)
-						}
+						msg.Text = fmt.Sprintf("Added: %s ✅", text)
 					}
-				case "pull":
-					// Get random item from database
-					var text string
-					err := db.QueryRow("SELECT text FROM items ORDER BY RANDOM() LIMIT 1").Scan(&text)
-					if err == sql.ErrNoRows {
-						msg.Text = "No items available."
-					} else if err != nil {
-						log.Printf("Error pulling item: %v", err)
-						msg.Text = "Failed to pull item."
-					} else {
-						lpMutex.Lock()
-						lastPulled[update.Message.Chat.ID] = text
-						lpMutex.Unlock()
-						msg.Text = fmt.Sprintf("🎲 %s", text)
-					}
-				case "delete":
-					// Delete last pulled item
-					lpMutex.RLock()
-					text, ok := lastPulled[update.Message.Chat.ID]
-					lpMutex.RUnlock()
+				}
+			case "pull":
+				// Get random item from database
+				var text string
+				err := db.QueryRow("SELECT text FROM items ORDER BY RANDOM() LIMIT 1").Scan(&text)
+				if err == sql.ErrNoRows {
+					msg.Text = "No items available."
+				} else if err != nil {
+					log.Printf("Error pulling item: %v", err)
+					msg.Text = "Failed to pull item."
+				} else {
+					lpMutex.Lock()
+					lastPulled[update.Message.Chat.ID] = text
+					lpMutex.Unlock()
+					msg.Text = fmt.Sprintf("🎲 %s", text)
+				}
+			case "delete":
+				// Delete last pulled item
+				lpMutex.RLock()
+				text, ok := lastPulled[update.Message.Chat.ID]
+				lpMutex.RUnlock()
 
-					if !ok {
-						msg.Text = "Pull an item first using /pull"
-					} else {
-						tx, err := db.Begin()
-						if err != nil {
-							log.Printf("Error starting transaction: %v", err)
-							msg.Text = "Failed to delete item."
-							break
-						}
-
-						// Store the item for undo functionality
-						ldMutex.Lock()
-						lastDeleted[update.Message.Chat.ID] = struct {
-							Text      string
-							DeletedAt time.Time
-						}{
-							Text:      text,
-							DeletedAt: time.Now(),
-						}
-						ldMutex.Unlock()
-
-						// Move item to deleted table
-						if _, err := tx.Exec("INSERT INTO deleted (text) VALUES (?)", text); err != nil {
-							tx.Rollback()
-							log.Printf("Error moving item to deleted: %v", err)
-							msg.Text = "Failed to delete item."
-							break
-						}
-
-						// Delete from items table
-						if _, err := tx.Exec("DELETE FROM items WHERE text = ?", text); err != nil {
-							tx.Rollback()
-							log.Printf("Error deleting item: %v", err)
-							msg.Text = "Failed to delete item."
-							break
-						}
-
-						if err := tx.Commit(); err != nil {
-							log.Printf("Error committing transaction: %v", err)
-							msg.Text = "Failed to delete item."
-							break
-						}
-
-						lpMutex.Lock()
-						delete(lastPulled, update.Message.Chat.ID)
-						lpMutex.Unlock()
-
-						msg.Text = fmt.Sprintf("Deleted: %s 🗑️", text)
-					}
-				case "list":
-					// List all items
-					rows, err := db.Query("SELECT text FROM items ORDER BY created_at DESC")
-					if err != nil {
-						log.Printf("Error listing items: %v", err)
-						msg.Text = "Failed to list items."
-					} else {
-						defer rows.Close()
-						var items []string
-						for rows.Next() {
-							var text string
-							if err := rows.Scan(&text); err != nil {
-								log.Printf("Error scanning row: %v", err)
-								continue
-							}
-							items = append(items, "• "+text)
-						}
-						if len(items) == 0 {
-							msg.Text = "No items stored."
-						} else {
-							msg.Text = "📝 Stored items:\n" + strings.Join(items, "\n")
-						}
-					}
-				case "deleted":
-					// List deleted items
-					rows, err := db.Query("SELECT text FROM deleted ORDER BY deleted_at DESC")
-					if err != nil {
-						log.Printf("Error listing deleted items: %v", err)
-						msg.Text = "Failed to list deleted items."
-					} else {
-						defer rows.Close()
-						var items []string
-						for rows.Next() {
-							var text string
-							if err := rows.Scan(&text); err != nil {
-								log.Printf("Error scanning row: %v", err)
-								continue
-							}
-							items = append(items, "• "+text)
-						}
-						if len(items) == 0 {
-							msg.Text = "No deleted items."
-						} else {
-							msg.Text = "🗑️ Deleted items:\n" + strings.Join(items, "\n")
-						}
-					}
-				case "export":
-					// Prepare response message
-					msg.Text = "📦 Preparing your data export..."
-					sentMsg, _ := bot.Send(msg)
-
-					// Fetch current items
-					rows, err := db.Query("SELECT text, created_at FROM items ORDER BY created_at")
-					if err != nil {
-						msg.Text = "❌ Failed to fetch items"
-						break
-					}
-					defer rows.Close()
-
-					var backup struct {
-						Items []struct {
-							Text      string    `json:"text"`
-							CreatedAt time.Time `json:"created_at"`
-						} `json:"items"`
-						DeletedItems []struct {
-							Text      string    `json:"text"`
-							DeletedAt time.Time `json:"deleted_at"`
-						} `json:"deleted_items"`
-						ExportedAt time.Time `json:"exported_at"`
-					}
-
-					backup.ExportedAt = time.Now()
-
-					// Read current items
-					for rows.Next() {
-						var item struct {
-							Text      string    `json:"text"`
-							CreatedAt time.Time `json:"created_at"`
-						}
-						if err := rows.Scan(&item.Text, &item.CreatedAt); err != nil {
-							continue
-						}
-						backup.Items = append(backup.Items, item)
-					}
-
-					// Fetch deleted items
-					rows, err = db.Query("SELECT text, deleted_at FROM deleted ORDER BY deleted_at")
-					if err != nil {
-						msg.Text = "❌ Failed to fetch deleted items"
-						break
-					}
-					defer rows.Close()
-
-					// Read deleted items
-					for rows.Next() {
-						var item struct {
-							Text      string    `json:"text"`
-							DeletedAt time.Time `json:"deleted_at"`
-						}
-						if err := rows.Scan(&item.Text, &item.DeletedAt); err != nil {
-							continue
-						}
-						backup.DeletedItems = append(backup.DeletedItems, item)
-					}
-
-					// Convert to pretty JSON
-					jsonData, err := json.MarshalIndent(backup, "", "    ")
-					if err != nil {
-						msg.Text = "❌ Failed to create backup"
-						break
-					}
-
-					// Create file with timestamp
-					filename := fmt.Sprintf("mindbot-backup-%s.json",
-						time.Now().Format("2006-01-02-150405"))
-
-					// Send as document
-					fileBytes := tgbot.FileBytes{
-						Name:  filename,
-						Bytes: jsonData,
-					}
-
-					doc := tgbot.NewDocument(update.Message.Chat.ID, fileBytes)
-					doc.Caption = fmt.Sprintf("📦 Your MindBot Backup\n• %d items\n• %d deleted items",
-						len(backup.Items), len(backup.DeletedItems))
-
-					if _, err := bot.Send(doc); err != nil {
-						msg.Text = "❌ Failed to send backup file"
-						break
-					}
-
-					// Delete the "preparing" message
-					deleteMsg := tgbot.NewDeleteMessage(update.Message.Chat.ID, sentMsg.MessageID)
-					bot.Send(deleteMsg)
-					continue
-
-				case "undo":
-					// Check if there's something to undo
-					ldMutex.RLock()
-					lastDel, exists := lastDeleted[update.Message.Chat.ID]
-					ldMutex.RUnlock()
-
-					if !exists {
-						msg.Text = "❌ Nothing to undo"
-						break
-					}
-
-					// Only allow undo within 1 hour of deletion
-					if time.Since(lastDel.DeletedAt) > time.Hour {
-						msg.Text = "❌ Can't undo deletions older than 1 hour"
-						break
-					}
-
-					// Start transaction
+				if !ok {
+					msg.Text = "Pull an item first using /pull"
+				} else {
 					tx, err := db.Begin()
 					if err != nil {
 						log.Printf("Error starting transaction: %v", err)
-						msg.Text = "❌ Failed to undo deletion"
+						msg.Text = "Failed to delete item."
 						break
 					}
 
-					// Move item back to items table
-					if _, err := tx.Exec("INSERT INTO items (text) VALUES (?)", lastDel.Text); err != nil {
+					// Store the item for undo functionality
+					ldMutex.Lock()
+					lastDeleted[update.Message.Chat.ID] = struct {
+						Text      string
+						DeletedAt time.Time
+					}{
+						Text:      text,
+						DeletedAt: time.Now(),
+					}
+					ldMutex.Unlock()
+
+					// Move item to deleted table
+					if _, err := tx.Exec("INSERT INTO deleted (text) VALUES (?)", text); err != nil {
 						tx.Rollback()
-						log.Printf("Error restoring item: %v", err)
-						msg.Text = "❌ Failed to restore item"
+						log.Printf("Error moving item to deleted: %v", err)
+						msg.Text = "Failed to delete item."
 						break
 					}
 
-					// Remove from deleted table
-					if _, err := tx.Exec("DELETE FROM deleted WHERE text = ?", lastDel.Text); err != nil {
+					// Delete from items table
+					if _, err := tx.Exec("DELETE FROM items WHERE text = ?", text); err != nil {
 						tx.Rollback()
-						log.Printf("Error removing from deleted: %v", err)
-						msg.Text = "❌ Failed to update deleted items"
+						log.Printf("Error deleting item: %v", err)
+						msg.Text = "Failed to delete item."
 						break
 					}
 
 					if err := tx.Commit(); err != nil {
 						log.Printf("Error committing transaction: %v", err)
-						msg.Text = "❌ Failed to complete undo"
+						msg.Text = "Failed to delete item."
 						break
 					}
 
-					// Clear the last deleted item
-					ldMutex.Lock()
-					delete(lastDeleted, update.Message.Chat.ID)
-					ldMutex.Unlock()
+					lpMutex.Lock()
+					delete(lastPulled, update.Message.Chat.ID)
+					lpMutex.Unlock()
 
-					msg.Text = fmt.Sprintf("✅ Restored: %s", lastDel.Text)
+					msg.Text = fmt.Sprintf("Deleted: %s 🗑️", text)
+				}
+			case "list":
+				// List all items
+				rows, err := db.Query("SELECT text FROM items ORDER BY created_at DESC")
+				if err != nil {
+					log.Printf("Error listing items: %v", err)
+					msg.Text = "Failed to list items."
+					break
+				}
+				defer rows.Close()
 
-				case "import":
-					// Set pending import state
-					importMutex.Lock()
-					importPending[update.Message.Chat.ID] = true
-					importMutex.Unlock()
-
-					msg.Text = "Please send your backup file (JSON format) in the next message.\n\n" +
-						"The file should be the one you received from the /export command."
-
-				case "help":
-					msg.Text = `I understand these commands:
-/add <text> - Store new text
-/pull - Get a random item
-/delete - Delete the last pulled item
-/list - Show all stored items
-/deleted - Show deleted items
-/export - Download a backup of all your data
-/import - Import items from a backup file
-/time <query> - Calculate times, convert formats, or check time zones
-/undo - Restore the last deleted item (within 1 hour)
-/help - Show this help message`
-				case "time":
-					query := update.Message.CommandArguments()
-					if query == "" {
-						msg.Text = "Usage: /time <your time-related question>\n\nExamples:\n- /time what time is 14:00?\n- /time if my flight is at 9:45 AM and I need 1h drive + 30m security, when to leave?\n- /time what time is it in Tokyo?"
-					} else {
-						response, err := timeCalculator.ProcessQuery(query)
-						if err != nil {
-							log.Printf("Error processing time query: %v", err)
-							msg.Text = "Sorry, I encountered an error while processing your time query. Please try again."
-						} else {
-							msg.Text = response
-						}
+				var items []string
+				for rows.Next() {
+					var text string
+					if err := rows.Scan(&text); err != nil {
+						log.Printf("Error scanning row: %v", err)
+						continue
 					}
-				default:
-					msg.Text = "I don't know that command. Try /help"
+					items = append(items, "• "+text)
 				}
 
-				if _, err := bot.Send(msg); err != nil {
-					log.Printf("Error sending message: %v", err)
-					time.Sleep(time.Second * 1)
-					continue
+				if len(items) == 0 {
+					msg.Text = "No items available."
+				} else {
+					msg.Text = "Your items:\n" + strings.Join(items, "\n")
 				}
+			case "time":
+				query := update.Message.CommandArguments()
+				if query == "" {
+					msg.Text = "Usage: /time what's the time in New York?"
+				} else {
+					response, err := timeCalculator.ProcessQuery(query)
+					if err != nil {
+						log.Printf("Error processing time query: %v", err)
+						msg.Text = fmt.Sprintf("Error: %v", err)
+					} else {
+						msg.Text = response
+					}
+				}
+			default:
+				msg.Text = "I don't know that command"
+			}
+
+			if _, err := bot.Send(msg); err != nil {
+				log.Printf("Error sending message: %v", err)
 			}
 		}
 
-		log.Printf("Update channel closed, reconnecting in 3 seconds...")
-		time.Sleep(time.Second * 3)
+		log.Printf("Updates channel closed, reconnecting...")
+		time.Sleep(time.Second) // Wait before reconnecting
 	}
 }

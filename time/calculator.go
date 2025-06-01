@@ -7,34 +7,40 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
 
-// TimeZoneInfo holds information about a location's time zone
-type TimeZoneInfo struct {
-	Location    string
-	CurrentTime time.Time
-	ZoneName    string
-	Offset      int // offset in hours from UTC
+// Common city names to IANA time zone mappings
+var timeZoneMap = map[string]string{
+	"london":    "Europe/London",
+	"austin":    "America/Chicago", // Austin uses Central Time
+	"new york":  "America/New_York",
+	"tokyo":     "Asia/Tokyo",
+	"paris":     "Europe/Paris",
+	"sydney":    "Australia/Sydney",
+	"singapore": "Asia/Singapore",
+	"dubai":     "Asia/Dubai",
+	"moscow":    "Europe/Moscow",
+	"berlin":    "Europe/Berlin",
+	"nyc":       "America/New_York",
+	"la":        "America/Los_Angeles",
+	"sf":        "America/Los_Angeles",
 }
 
-// GetTimeZoneInfo returns the current time zone information for a location
-func GetTimeZoneInfo(location string) (*TimeZoneInfo, error) {
-	// Map common city names to IANA time zone names
-	timeZoneMap := map[string]string{
-		"london":    "Europe/London",
-		"austin":    "America/Chicago", // Austin uses Central Time
-		"new york":  "America/New_York",
-		"tokyo":     "Asia/Tokyo",
-		"paris":     "Europe/Paris",
-		"sydney":    "Australia/Sydney",
-		"singapore": "Asia/Singapore",
-		"dubai":     "Asia/Dubai",
-		"moscow":    "Europe/Moscow",
-		"berlin":    "Europe/Berlin",
-	}
+// TimeZoneInfo holds information about a location's time zone
+type TimeZoneInfo struct {
+	Location       string
+	CurrentTime    time.Time
+	ZoneName       string
+	Offset         int        // offset in hours from UTC
+	IsDST          bool       // whether DST is in effect
+	NextTransition *time.Time // next DST transition, if any
+}
 
+// GetDetailedTimeZoneInfo returns detailed time zone information for a location
+func GetDetailedTimeZoneInfo(location string) (*TimeZoneInfo, error) {
 	// Clean up input
 	location = strings.ToLower(strings.TrimSpace(location))
 
@@ -57,12 +63,114 @@ func GetTimeZoneInfo(location string) (*TimeZoneInfo, error) {
 	// Get zone name and offset
 	name, offset := now.Zone()
 
+	// Get next transition (if any)
+	var nextTransition *time.Time
+	if trans, ok := getNextTransition(now, loc); ok {
+		nextTransition = &trans
+	}
+
 	return &TimeZoneInfo{
-		Location:    location,
-		CurrentTime: now,
-		ZoneName:    name,
-		Offset:      offset / 3600, // Convert seconds to hours
+		Location:       location,
+		CurrentTime:    now,
+		ZoneName:       name,
+		Offset:         offset / 3600, // Convert seconds to hours
+		IsDST:          now.IsDST(),
+		NextTransition: nextTransition,
 	}, nil
+}
+
+// ConvertTimeZones converts a time between two locations
+func ConvertTimeZones(timeStr, fromLocation, toLocation string) (string, error) {
+	// Get time zone info for both locations
+	fromInfo, err := GetDetailedTimeZoneInfo(fromLocation)
+	if err != nil {
+		return "", fmt.Errorf("invalid source location: %v", err)
+	}
+
+	toInfo, err := GetDetailedTimeZoneInfo(toLocation)
+	if err != nil {
+		return "", fmt.Errorf("invalid destination location: %v", err)
+	}
+
+	// Parse the input time
+	t, err := time.Parse("3:04 PM", timeStr)
+	if err != nil {
+		return "", fmt.Errorf("invalid time format: %v", err)
+	}
+
+	// Create a time in the source location
+	sourceTime := time.Date(
+		time.Now().Year(),
+		time.Now().Month(),
+		time.Now().Day(),
+		t.Hour(),
+		t.Minute(),
+		0, 0,
+		time.Local,
+	).In(fromInfo.CurrentTime.Location())
+
+	// Convert to destination time zone
+	destTime := sourceTime.In(toInfo.CurrentTime.Location())
+
+	// Check if it's the next/previous day
+	dayDiff := destTime.Day() - sourceTime.Day()
+	nextDay := ""
+	if dayDiff == 1 {
+		nextDay = " (next day)"
+	} else if dayDiff == -1 {
+		nextDay = " (previous day)"
+	}
+
+	return fmt.Sprintf("%s %s (UTC%+d) → %s %s (UTC%+d)%s",
+		sourceTime.Format("3:04 PM (15:04)"),
+		fromInfo.ZoneName,
+		fromInfo.Offset,
+		destTime.Format("3:04 PM (15:04)"),
+		toInfo.ZoneName,
+		toInfo.Offset,
+		nextDay,
+	), nil
+}
+
+// ValidateLocationName checks if a location is valid and returns suggestions if not
+func ValidateLocationName(location string) (bool, []string) {
+	location = strings.ToLower(strings.TrimSpace(location))
+
+	// Check common locations first
+	if _, ok := timeZoneMap[location]; ok {
+		return true, nil
+	}
+
+	// Try loading the location directly
+	_, err := time.LoadLocation(location)
+	if err == nil {
+		return true, nil
+	}
+
+	// If not found, look for similar locations
+	var suggestions []string
+	for loc := range timeZoneMap {
+		if strings.Contains(loc, location) || strings.Contains(location, loc) {
+			suggestions = append(suggestions, loc)
+		}
+	}
+
+	return false, suggestions
+}
+
+// Helper function to get the next DST transition
+func getNextTransition(t time.Time, loc *time.Location) (time.Time, bool) {
+	// Look ahead up to a year for the next transition
+	for i := 0; i < 365; i++ {
+		t = t.AddDate(0, 0, 1)
+		_, offset1 := t.Zone()
+		tomorrow := t.AddDate(0, 0, 1)
+		_, offset2 := tomorrow.Zone()
+		if offset1 != offset2 {
+			return t, true
+		}
+	}
+	return t, false
 }
 
 type OpenRouterRequest struct {
@@ -107,78 +215,109 @@ func (tc *TimeCalculator) ProcessQuery(query string) (string, error) {
 	// We'll use Claude-2 for its strong reasoning capabilities
 	model := "anthropic/claude-2"
 
-	// Get current time in UTC
-	now := time.Now()
+	systemPrompt := `You are a time calculation assistant. To perform time calculations, you MUST use the exact tool call format:
 
-	// Try to get time zone info if this is a time zone query
-	var tzInfo *TimeZoneInfo
-	if strings.Contains(strings.ToLower(query), "time") && strings.Contains(strings.ToLower(query), "in") {
-		// Extract location from query (simple extraction, can be improved)
-		parts := strings.Split(strings.ToLower(query), "in")
-		if len(parts) > 1 {
-			location := strings.TrimSpace(parts[len(parts)-1])
-			// Remove common words
-			location = strings.TrimSuffix(location, "?")
-			location = strings.TrimPrefix(location, "the")
-			location = strings.TrimSpace(location)
+Tool: GetCurrentTime("location")
+Tool: ConvertTimeZones("time", "fromZone", "toZone")
+Tool: GetDetailedTimeZoneInfo("location")
+Tool: ValidateLocationName("location")
 
-			info, err := GetTimeZoneInfo(location)
-			if err == nil {
-				tzInfo = info
+The tools available are:
+
+1. GetCurrentTime(location)
+   Input: City or location name in quotes
+   Returns: Current time, zone name, and DST status
+   Example: Tool: GetCurrentTime("New York")
+
+2. ConvertTimeZones(time, fromZone, toZone)
+   Input: Time expression and location names in quotes
+   Returns: Converted time with zone details
+   Example: Tool: ConvertTimeZones("2:30 PM", "New York", "Tokyo")
+
+3. GetDetailedTimeZoneInfo(location)
+   Input: City or location name in quotes
+   Returns: Zone name, offset, and DST information
+   Example: Tool: GetDetailedTimeZoneInfo("London")
+
+4. ValidateLocationName(location)
+   Input: City or location name in quotes
+   Returns: Whether location is valid and suggestions if not
+   Example: Tool: ValidateLocationName("NYC")
+
+IMPORTANT RULES:
+1. ALWAYS use the EXACT tool call format shown above
+2. NEVER perform manual time calculations
+3. NEVER assume time zones or offsets
+4. NEVER use hardcoded example times - always use the tools
+5. Validate locations before using them
+6. Show both 12h and 24h time formats
+7. Include DST information when relevant
+8. For queries about current time, ALWAYS use GetCurrentTime
+9. For time conversions, ALWAYS use ConvertTimeZones
+
+Example Usage:
+
+Q: "What time is it in Tokyo?"
+A: Let me check the current time in Tokyo.
+First, I'll validate the location:
+Tool: ValidateLocationName("Tokyo")
+Now I'll get the current time:
+Tool: GetCurrentTime("Tokyo")
+
+Q: "If it's 2pm in New York, what time is it in London?"
+A: I'll help you with that conversion.
+1. Validate both locations:
+   Tool: ValidateLocationName("New York")
+   Tool: ValidateLocationName("London")
+2. Convert the time:
+   Tool: ConvertTimeZones("2:00 PM", "New York", "London")
+
+Q: "What's the time difference between Paris and Sydney?"
+A: Let me check both time zones.
+1. Get information for both cities:
+   Tool: GetDetailedTimeZoneInfo("Paris")
+   Tool: GetDetailedTimeZoneInfo("Sydney")
+
+For any time-related query:
+1. Always validate locations first using Tool: ValidateLocationName("location")
+2. For current time, use Tool: GetCurrentTime("location")
+3. For conversions, use Tool: ConvertTimeZones("time", "from", "to")
+4. For zone info, use Tool: GetDetailedTimeZoneInfo("location")
+5. Format responses clearly with both 12h and 24h times
+6. Include relevant DST information
+7. Show step-by-step calculations when needed`
+
+	// Extract tool calls from the response and execute them
+	toolPattern := regexp.MustCompile(`Tool: (\w+)\("([^"]+)"(?:, "([^"]+)")?(?:, "([^"]+)")?\)`)
+
+	// Process any tool calls in the query first
+	toolCalls := toolPattern.FindAllStringSubmatch(query, -1)
+	for _, call := range toolCalls {
+		toolName := call[1]
+		args := call[2:]
+
+		// Remove empty args
+		var validArgs []string
+		for _, arg := range args {
+			if arg != "" {
+				validArgs = append(validArgs, arg)
 			}
 		}
+
+		// Execute the tool and replace the call with its result
+		result, err := tc.executeTool(toolName, validArgs...)
+		if err != nil {
+			log.Printf("Error executing tool %s: %v", toolName, err)
+			continue
+		}
+
+		// Replace the tool call with its result
+		query = strings.Replace(query, call[0], result, 1)
 	}
-
-	systemPrompt := `You are a time calculation assistant. Your task is to:
-1. Parse time-related queries
-2. Show step-by-step calculations when relevant
-3. Handle time zones, formats (12h/24h), and arithmetic
-4. Present results clearly and concisely
-5. Use ONLY the provided time zone information for calculations
-6. Always show both 12h and 24h format in responses when relevant
-
-IMPORTANT: When time zone information is provided, DO NOT perform manual calculations. 
-Instead, use the exact local time that was queried from the IANA Time Zone database.
-
-The current time will be provided with each query in UTC.`
-
-	// Add time zone info to the prompt if available
-	if tzInfo != nil {
-		systemPrompt += fmt.Sprintf(`
-
-LOCATION TIME ZONE DATA (Use this exact information, do not calculate manually):
-• Location: %s
-• Current local time: %s
-• Time zone: %s (UTC%+d)
-• DST status: %s
-
-For time zone queries, use this information directly instead of doing manual calculations.
-`,
-			tzInfo.Location,
-			tzInfo.CurrentTime.Format("3:04 PM (15:04)"),
-			tzInfo.ZoneName,
-			tzInfo.Offset,
-			map[bool]string{true: "in effect", false: "not in effect"}[tzInfo.CurrentTime.IsDST()])
-	}
-
-	systemPrompt += `
-
-Example outputs:
-Q: "What time is 14:00?"
-A: 14:00 is 2:00 PM
-
-Q: "If my flight is at 9:45 AM and I need 1h drive + 30m security, when to leave?"
-A: Let's calculate backwards:
-1. Flight time: 9:45 AM
-2. Security: -30 minutes
-3. Drive: -1 hour
-→ You should leave at 8:15 AM (08:15)
-
-Keep responses focused and precise. For time zone queries, always use the provided IANA Time Zone data instead of doing manual calculations.`
 
 	// Add current time to user's query
 	queryWithTime := fmt.Sprintf("Current time: %s UTC\n\nQuery: %s",
-		now.Format("15:04"),
+		time.Now().Format("15:04"),
 		query)
 
 	messages := []Message{
@@ -203,7 +342,7 @@ Keep responses focused and precise. For time zone queries, always use the provid
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+tc.openRouterKey)
-	req.Header.Set("HTTP-Referer", "https://github.com/jgabriele321/onmymind") // Updated to your repo
+	req.Header.Set("HTTP-Referer", "https://github.com/jgabriele321/onmymind")
 	req.Header.Set("X-Title", "OnMuyMind Bot")
 
 	resp, err := tc.client.Do(req)
@@ -235,7 +374,83 @@ Keep responses focused and precise. For time zone queries, always use the provid
 		return "", fmt.Errorf("no response from OpenRouter")
 	}
 
-	// Clean up the response
-	response := strings.TrimSpace(openRouterResp.Choices[0].Message.Content)
-	return response, nil
+	response := openRouterResp.Choices[0].Message.Content
+
+	// Process any tool calls in the response
+	toolCalls = toolPattern.FindAllStringSubmatch(response, -1)
+	for _, call := range toolCalls {
+		toolName := call[1]
+		args := call[2:]
+
+		// Remove empty args
+		var validArgs []string
+		for _, arg := range args {
+			if arg != "" {
+				validArgs = append(validArgs, arg)
+			}
+		}
+
+		// Execute the tool and replace the call with its result
+		result, err := tc.executeTool(toolName, validArgs...)
+		if err != nil {
+			log.Printf("Error executing tool %s: %v", toolName, err)
+			continue
+		}
+
+		// Replace the tool call with its result
+		response = strings.Replace(response, call[0], result, 1)
+	}
+
+	return strings.TrimSpace(response), nil
+}
+
+// executeTool executes a tool function with the given arguments
+func (tc *TimeCalculator) executeTool(name string, args ...string) (string, error) {
+	switch name {
+	case "GetCurrentTime":
+		if len(args) != 1 {
+			return "", fmt.Errorf("GetCurrentTime requires exactly 1 argument")
+		}
+		result, err := GetCurrentTimeWithTools(args[0])
+		if err != nil {
+			return "", err
+		}
+		return result, nil
+
+	case "ConvertTimeZones":
+		if len(args) != 3 {
+			return "", fmt.Errorf("ConvertTimeZones requires exactly 3 arguments")
+		}
+		result, err := ConvertTimeZonesWithTools(args[0], args[1], args[2])
+		if err != nil {
+			return "", err
+		}
+		return result, nil
+
+	case "GetDetailedTimeZoneInfo":
+		if len(args) != 1 {
+			return "", fmt.Errorf("GetDetailedTimeZoneInfo requires exactly 1 argument")
+		}
+		result, err := GetDetailedTimeZoneInfoWithTools(args[0])
+		if err != nil {
+			return "", err
+		}
+		return result, nil
+
+	case "ValidateLocationName":
+		if len(args) != 1 {
+			return "", fmt.Errorf("ValidateLocationName requires exactly 1 argument")
+		}
+		valid, suggestions := ValidateLocationNameWithTools(args[0])
+		if valid {
+			return "true", nil
+		}
+		if len(suggestions) > 0 {
+			return fmt.Sprintf("false, suggestions: %s", strings.Join(suggestions, ", ")), nil
+		}
+		return "false", nil
+
+	default:
+		return "", fmt.Errorf("unknown tool: %s", name)
+	}
 }
