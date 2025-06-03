@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tgbot "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/jgabriele321/onmymind/reminder"
 	timecalc "github.com/jgabriele321/onmymind/time"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -25,8 +26,9 @@ var (
 		Text      string
 		DeletedAt time.Time
 	})
-	ldMutex        = &sync.RWMutex{} // Protects lastDeleted map
-	timeCalculator *timecalc.TimeCalculator
+	ldMutex         = &sync.RWMutex{} // Protects lastDeleted map
+	timeCalculator  *timecalc.TimeCalculator
+	reminderHandler *reminder.Handler
 )
 
 func startHealthCheck() {
@@ -72,6 +74,7 @@ func initDB() error {
 
 	// Create tables if they don't exist
 	schema := `
+	-- Existing tables
 	CREATE TABLE IF NOT EXISTS items (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		text TEXT NOT NULL,
@@ -81,7 +84,38 @@ func initDB() error {
 		id INTEGER PRIMARY KEY,
 		text TEXT NOT NULL,
 		deleted_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);`
+	);
+
+	-- New reminder tables
+	CREATE TABLE IF NOT EXISTS reminders (
+		id TEXT PRIMARY KEY, -- UUID
+		user_id TEXT NOT NULL,
+		title TEXT NOT NULL,
+		description TEXT,
+		due_time DATETIME NOT NULL,
+		recurrence_pattern TEXT,
+		priority BOOLEAN DEFAULT 0,
+		status TEXT CHECK(status IN ('pending', 'completed', 'cancelled')) DEFAULT 'pending',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS reminder_logs (
+		id TEXT PRIMARY KEY, -- UUID
+		reminder_id TEXT NOT NULL,
+		notification_type TEXT CHECK(notification_type IN ('telegram_message', 'telegram_call')) NOT NULL,
+		status TEXT CHECK(status IN ('success', 'failed')) NOT NULL,
+		error_message TEXT,
+		attempted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (reminder_id) REFERENCES reminders(id) ON DELETE CASCADE
+	);
+
+	-- Indexes for better query performance
+	CREATE INDEX IF NOT EXISTS idx_reminders_user_id ON reminders(user_id);
+	CREATE INDEX IF NOT EXISTS idx_reminders_due_time ON reminders(due_time);
+	CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status);
+	CREATE INDEX IF NOT EXISTS idx_reminder_logs_reminder_id ON reminder_logs(reminder_id);
+	CREATE INDEX IF NOT EXISTS idx_reminder_logs_attempted_at ON reminder_logs(attempted_at);`
 
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("failed to create schema: %v", err)
@@ -146,7 +180,7 @@ func main() {
 		log.Printf("Warning: Error loading .env file: %v", err)
 	}
 
-	// Get environment variables (works both in development and production)
+	// Get environment variables
 	token := os.Getenv("BOT_TOKEN")
 	if token == "" {
 		log.Fatal("BOT_TOKEN environment variable is not set")
@@ -162,13 +196,28 @@ func main() {
 	// Initialize time calculator
 	timeCalculator = timecalc.NewTimeCalculator(openRouterKey)
 
-	// Simple version to test that the bot works
+	// Initialize reminder system
+	reminderStore := reminder.NewSQLiteStore(db)
+	reminderService := reminder.NewService(reminderStore)
+	location, err := time.LoadLocation("Local") // Use system timezone
+	if err != nil {
+		log.Printf("Warning: Failed to load local timezone: %v", err)
+		location = time.UTC
+	}
+	reminderHandler = reminder.NewHandler(reminderService, location)
+
+	// Create bot instance
 	bot, err := tgbot.NewBotAPI(token)
 	if err != nil {
 		log.Fatalf("Failed to create bot: %v", err)
 	}
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
+
+	// Initialize and start the reminder scheduler
+	scheduler := reminder.NewScheduler(reminderService, bot, location)
+	scheduler.Start()
+	defer scheduler.Stop()
 
 	// Configure update parameters
 	u := tgbot.NewUpdate(0)
@@ -193,114 +242,42 @@ func main() {
 			msg := tgbot.NewMessage(update.Message.Chat.ID, "")
 
 			switch update.Message.Command() {
-			case "add":
-				text := update.Message.CommandArguments()
-				if text == "" {
-					msg.Text = "Usage: /add something"
-				} else {
-					// Store in database
-					if _, err := db.Exec("INSERT INTO items (text) VALUES (?)", text); err != nil {
-						log.Printf("Error storing item: %v", err)
-						msg.Text = "Failed to store item."
-					} else {
-						msg.Text = fmt.Sprintf("Added: %s ✅", text)
-					}
-				}
-			case "pull":
-				// Get random item from database
-				var text string
-				err := db.QueryRow("SELECT text FROM items ORDER BY RANDOM() LIMIT 1").Scan(&text)
-				if err == sql.ErrNoRows {
-					msg.Text = "No items available."
-				} else if err != nil {
-					log.Printf("Error pulling item: %v", err)
-					msg.Text = "Failed to pull item."
-				} else {
-					lpMutex.Lock()
-					lastPulled[update.Message.Chat.ID] = text
-					lpMutex.Unlock()
-					msg.Text = fmt.Sprintf("🎲 %s", text)
-				}
-			case "delete":
-				// Delete last pulled item
-				lpMutex.RLock()
-				text, ok := lastPulled[update.Message.Chat.ID]
-				lpMutex.RUnlock()
-
-				if !ok {
-					msg.Text = "Pull an item first using /pull"
-				} else {
-					tx, err := db.Begin()
-					if err != nil {
-						log.Printf("Error starting transaction: %v", err)
-						msg.Text = "Failed to delete item."
-						break
-					}
-
-					// Store the item for undo functionality
-					ldMutex.Lock()
-					lastDeleted[update.Message.Chat.ID] = struct {
-						Text      string
-						DeletedAt time.Time
-					}{
-						Text:      text,
-						DeletedAt: time.Now(),
-					}
-					ldMutex.Unlock()
-
-					// Move item to deleted table
-					if _, err := tx.Exec("INSERT INTO deleted (text) VALUES (?)", text); err != nil {
-						tx.Rollback()
-						log.Printf("Error moving item to deleted: %v", err)
-						msg.Text = "Failed to delete item."
-						break
-					}
-
-					// Delete from items table
-					if _, err := tx.Exec("DELETE FROM items WHERE text = ?", text); err != nil {
-						tx.Rollback()
-						log.Printf("Error deleting item: %v", err)
-						msg.Text = "Failed to delete item."
-						break
-					}
-
-					if err := tx.Commit(); err != nil {
-						log.Printf("Error committing transaction: %v", err)
-						msg.Text = "Failed to delete item."
-						break
-					}
-
-					lpMutex.Lock()
-					delete(lastPulled, update.Message.Chat.ID)
-					lpMutex.Unlock()
-
-					msg.Text = fmt.Sprintf("Deleted: %s 🗑️", text)
-				}
-			case "list":
-				// List all items
-				rows, err := db.Query("SELECT text FROM items ORDER BY created_at DESC")
+			case "remindme":
+				response, err := reminderHandler.HandleRemindMe(update.Message)
 				if err != nil {
-					log.Printf("Error listing items: %v", err)
-					msg.Text = "Failed to list items."
-					break
-				}
-				defer rows.Close()
-
-				var items []string
-				for rows.Next() {
-					var text string
-					if err := rows.Scan(&text); err != nil {
-						log.Printf("Error scanning row: %v", err)
-						continue
-					}
-					items = append(items, "• "+text)
-				}
-
-				if len(items) == 0 {
-					msg.Text = "No items available."
+					log.Printf("Error handling remindme: %v", err)
+					msg.Text = "❌ An error occurred"
 				} else {
-					msg.Text = "Your items:\n" + strings.Join(items, "\n")
+					msg.Text = response
 				}
+
+			case "reminders":
+				response, err := reminderHandler.HandleReminders(update.Message)
+				if err != nil {
+					log.Printf("Error handling reminders: %v", err)
+					msg.Text = "❌ An error occurred"
+				} else {
+					msg.Text = response
+				}
+
+			case "delete":
+				response, err := reminderHandler.HandleDelete(update.Message)
+				if err != nil {
+					log.Printf("Error handling delete: %v", err)
+					msg.Text = "❌ An error occurred"
+				} else {
+					msg.Text = response
+				}
+
+			case "complete":
+				response, err := reminderHandler.HandleComplete(update.Message)
+				if err != nil {
+					log.Printf("Error handling complete: %v", err)
+					msg.Text = "❌ An error occurred"
+				} else {
+					msg.Text = response
+				}
+
 			case "time":
 				query := update.Message.CommandArguments()
 				if query == "" {
@@ -314,8 +291,24 @@ func main() {
 						msg.Text = response
 					}
 				}
+
+			case "help":
+				msg.Text = `Available commands:
+/remindme <time> to <message> [-call] - Set a reminder
+/reminders [all|priority|regular] - List your reminders
+/delete <reminder_id> - Delete a reminder
+/complete <reminder_id> - Mark a reminder as completed
+/time <query> - Calculate times and time zones
+
+Examples:
+• /remindme in 2 hours to check email
+• /remindme tomorrow at 3pm to call mom -call
+• /remindme every Sunday at 10am to water plants
+• /time what's 2 hours before 3pm?
+• /time convert 14:00 to EST`
+
 			default:
-				msg.Text = "I don't know that command"
+				msg.Text = "I don't know that command. Try /help for available commands."
 			}
 
 			if _, err := bot.Send(msg); err != nil {

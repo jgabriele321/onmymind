@@ -5,14 +5,11 @@ BOT_TOKEN=$(grep BOT_TOKEN .env | cut -d '=' -f2)
 
 # Command definitions
 COMMANDS='[
-  {"command":"add","description":"Store new text"},
-  {"command":"pull","description":"Get a random item"},
-  {"command":"delete","description":"Delete the last pulled item"},
-  {"command":"list","description":"Show all stored items"},
-  {"command":"deleted","description":"Show deleted items"},
-  {"command":"export","description":"Download a backup of all your data"},
+  {"command":"remindme","description":"Set a one-time or recurring reminder, use -call for priority"},
+  {"command":"reminders","description":"List all reminders with optional filter"},
+  {"command":"delete","description":"Delete a specific reminder"},
+  {"command":"complete","description":"Mark a reminder as completed"},
   {"command":"time","description":"Calculate times, convert formats, or check time zones"},
-  {"command":"undo","description":"Restore the last deleted item (within 1 hour)"},
   {"command":"help","description":"Show help message"}
 ]'
 

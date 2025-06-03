@@ -4,6 +4,9 @@
 .env.*.local
 !.env.example
 
+# Development directory
+dev/
+
 # Go specific
 *.exe
 *.exe~
