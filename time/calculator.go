@@ -212,8 +212,8 @@ func (tc *TimeCalculator) ProcessQuery(query string) (string, error) {
 		return "", fmt.Errorf("OpenRouter API key is not configured")
 	}
 
-	// We'll use Claude-2 for its strong reasoning capabilities
-	model := "anthropic/claude-2"
+	// We'll use Claude 3.5 Sonnet for its strong reasoning capabilities
+	model := "anthropic/claude-3.5-sonnet"
 
 	systemPrompt := `You are a time calculation assistant. To perform time calculations, you MUST use the exact tool call format:
 
@@ -360,7 +360,9 @@ For any time-related query:
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("OpenRouter API error: Status %d, Body: %s", resp.StatusCode, string(body))
-		return "", fmt.Errorf("OpenRouter API error: %s", resp.Status)
+		log.Printf("Request URL: %s", req.URL.String())
+		log.Printf("Request Model: %s", model)
+		return "", fmt.Errorf("OpenRouter API error: %d %s - %s", resp.StatusCode, resp.Status, string(body))
 	}
 
 	var openRouterResp OpenRouterResponse
